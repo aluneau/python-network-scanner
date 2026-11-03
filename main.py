@@ -23,18 +23,45 @@ app = FastAPI(title="Network Scanner API", version="1.0.0")
 # In-memory storage for scans
 scans: Dict[str, dict] = {}
 
-# Ports probed to decide whether a host is up
-COMMON_PORTS = [80, 443, 22, 8080, 3000, 8000, 9000]
+# Main service ports: probed on every host, both to detect that it is up and
+# to report what it runs. Extra ports can be added per scan with `port_list`.
+MAIN_PORTS: Dict[int, str] = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+    80: "http", 110: "pop3", 111: "rpcbind", 135: "msrpc", 139: "netbios",
+    143: "imap", 443: "https", 445: "smb", 465: "smtps", 554: "rtsp",
+    587: "smtp-submission", 631: "ipp", 993: "imaps", 995: "pop3s", 1433: "mssql",
+    1883: "mqtt", 2049: "nfs", 2379: "etcd", 3000: "http-alt", 3306: "mysql",
+    3389: "rdp", 5000: "http-alt", 5432: "postgresql", 5900: "vnc", 6379: "redis",
+    6443: "kubernetes-api", 8000: "http-alt", 8080: "http-proxy", 8443: "https-alt",
+    8888: "http-alt", 9000: "http-alt", 9090: "prometheus", 9100: "jetdirect/node-exporter",
+    10250: "kubelet", 27017: "mongodb",
+}
+PORT_TIMEOUT = float(os.environ.get("PORT_TIMEOUT", "0.5"))
+
+
+def parse_networks(value: str) -> List[ipaddress.IPv4Network]:
+    networks = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logging.getLogger("network_scanner").warning("Ignoring invalid network %r", item)
+    return networks
+
+
+# Common home/office networks, scanned in addition to the detected ones
+# when no `network` is given. Override with COMMON_NETWORKS="a/24,b/24".
+COMMON_NETWORKS = parse_networks(os.environ.get(
+    "COMMON_NETWORKS", "192.168.0.0/24,192.168.1.0/24,192.168.88.0/24,10.0.0.0/24"
+))
 # Max hosts scanned per network
 MAX_HOSTS = 254
-# Max concurrent TCP connection attempts
-MAX_CONCURRENT_CONNECTIONS = 512
+# Max concurrent TCP connection attempts (each uses a file descriptor)
+MAX_CONCURRENT_CONNECTIONS = int(os.environ.get("SCAN_CONCURRENCY", "1024"))
 HOSTNAME_TIMEOUT = 2.0
-
-# Common home/office gateways probed (in order) when no usable network is detected,
-# e.g. in a Kubernetes pod with a /32 address. Each one that answers gets its /24 scanned.
-FALLBACK_GATEWAYS = ["192.168.0.1", "192.168.1.1", "192.168.88.1", "10.0.0.1"]
-FALLBACK_PREFIX = 24
 
 # Interfaces created by container runtimes, CNIs and hypervisors. On a node
 # (hostNetwork) they hold pod/VM subnets, not the node's LAN, so auto-scan skips them.
@@ -61,8 +88,12 @@ def utcnow() -> str:
 
 class ScanRequest(BaseModel):
     network: Optional[str] = None
-    scan_ports: Optional[bool] = False
+    # Report open ports / services for each host
+    scan_ports: Optional[bool] = True
+    # Extra ports to probe on top of MAIN_PORTS
     port_list: Optional[List[int]] = None
+    # When no `network` is given, also scan COMMON_NETWORKS
+    include_common_networks: Optional[bool] = True
 
 class ScanResponse(BaseModel):
     scan_id: str
@@ -110,7 +141,7 @@ def get_network_info():
             "gateway": find_gateway(),
             "default_interface": default_interface(routes),
             "public_ip": get_public_ip(),
-            "scan_targets": [str(n) for n in node_networks(interfaces, routes)],
+            "scan_targets": [str(n) for n in auto_networks(interfaces, routes)],
             "interfaces": interfaces,
             "routes": routes
         }
@@ -136,6 +167,7 @@ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
         "created_at": utcnow(),
         "completed_at": None,
         "network_info": None,
+        "networks": [],
         "hosts": [],
         "error": None
     }
@@ -175,6 +207,11 @@ def public_ip():
     if ip is None:
         raise HTTPException(status_code=502, detail=f"Could not get public IP from {PUBLIC_IP_URL}")
     return {"public_ip": ip, "source": PUBLIC_IP_URL}
+
+@app.get("/api/v1/ports")
+def list_main_ports():
+    """Ports probed on every host"""
+    return [{"port": p, "service": name} for p, name in MAIN_PORTS.items()]
 
 @app.get("/api/v1/scans")
 def list_scans():
@@ -308,17 +345,16 @@ async def run_scan(scan_id: str, request: ScanRequest):
                 scans[scan_id]["error"] = f"Invalid network: {request.network}"
                 return
         else:
-            networks_to_scan = node_networks(interfaces, routes)
+            networks_to_scan = auto_networks(interfaces, routes, request.include_common_networks)
 
-            if not networks_to_scan:
-                networks_to_scan = await find_fallback_networks(request)
-                scans[scan_id]["network_info"]["fallback_networks"] = [str(n) for n in networks_to_scan]
-        
-        # Scan networks
-        all_hosts = []
-        for network in networks_to_scan:
-            hosts = await scan_network(network, request)
-            all_hosts.extend(hosts)
+        scans[scan_id]["networks"] = [str(n) for n in networks_to_scan]
+
+        # Scan all networks concurrently, sharing one connection limit
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
+        results = await asyncio.gather(
+            *(scan_network(network, request, semaphore) for network in networks_to_scan)
+        )
+        all_hosts = [host for hosts in results for host in hosts]
         
         scans[scan_id]["hosts"] = all_hosts
         scans[scan_id]["status"] = "completed"
@@ -365,23 +401,21 @@ def is_scannable(network: ipaddress.IPv4Network) -> bool:
     return not (network.is_loopback or network.is_link_local or network.prefixlen >= 31)
 
 
-async def find_fallback_networks(request: ScanRequest) -> List[ipaddress.IPv4Network]:
-    """Probe common gateways and return the /24 of each one that answers"""
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
-    results = await asyncio.gather(
-        *(check_host(gw, ScanRequest(), semaphore, resolve=False) for gw in FALLBACK_GATEWAYS)
-    )
-    networks = []
-    for gw, result in zip(FALLBACK_GATEWAYS, results):
-        if result["is_up"]:
-            logger.info("Fallback gateway %s answered", gw)
-            networks.append(ipaddress.ip_network(f"{gw}/{FALLBACK_PREFIX}", strict=False))
+def auto_networks(interfaces: List[Dict[str, Any]], routes: List[Dict[str, Any]],
+                  include_common: bool = True) -> List[ipaddress.IPv4Network]:
+    """Detected node networks first, then COMMON_NETWORKS not already covered"""
+    networks = node_networks(interfaces, routes)
+    if include_common:
+        for network in COMMON_NETWORKS:
+            if not any(network.overlaps(n) for n in networks):
+                networks.append(network)
     return networks
 
 
-async def scan_network(network: ipaddress.IPv4Network, request: ScanRequest) -> List[dict]:
+async def scan_network(network: ipaddress.IPv4Network, request: ScanRequest,
+                       semaphore: Optional[asyncio.Semaphore] = None) -> List[dict]:
     """Scan a network for active hosts"""
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
+    semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
 
     # Limit to the first MAX_HOSTS hosts without materialising huge networks
     host_ips = itertools.islice(network.hosts(), MAX_HOSTS)
@@ -421,26 +455,40 @@ async def resolve_hostname(ip: str) -> Optional[str]:
         return None
 
 
+def ports_to_probe(request: ScanRequest) -> List[int]:
+    extra = [p for p in (request.port_list or []) if p not in MAIN_PORTS]
+    return list(MAIN_PORTS) + list(dict.fromkeys(extra))
+
+
+def service_name(port: int) -> str:
+    if port in MAIN_PORTS:
+        return MAIN_PORTS[port]
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "unknown"
+
+
 async def check_host(ip: str, request: ScanRequest, semaphore: Optional[asyncio.Semaphore] = None,
                      resolve: bool = True) -> dict:
-    """Check if a host is up"""
+    """Check if a host is up by probing the main ports, and report open ones"""
     semaphore = semaphore or asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
     start_time = time.monotonic()
     response_time: Optional[float] = None
+    ports = ports_to_probe(request)
     statuses: Dict[int, Optional[str]] = {}
 
     async def probe(port: int) -> None:
         nonlocal response_time
-        status = await probe_port(ip, port, 0.5, semaphore)
+        status = await probe_port(ip, port, PORT_TIMEOUT, semaphore)
         statuses[port] = status
         if status and response_time is None:
             response_time = (time.monotonic() - start_time) * 1000
 
-    # Probe common ports concurrently
-    await asyncio.gather(*(probe(p) for p in COMMON_PORTS))
+    await asyncio.gather(*(probe(p) for p in ports))
 
     is_up = response_time is not None
-    open_ports = [p for p in COMMON_PORTS if statuses.get(p) == "open"]
+    open_ports = sorted(p for p in ports if statuses.get(p) == "open") if request.scan_ports else []
 
     result = {
         "ip": ip,
@@ -448,21 +496,12 @@ async def check_host(ip: str, request: ScanRequest, semaphore: Optional[asyncio.
         "hostname": None,
         "response_time_ms": round(response_time, 2) if is_up else None,
         "mac_address": None,
-        "open_ports": open_ports if request.scan_ports else []
+        "open_ports": open_ports,
+        "services": [{"port": p, "service": service_name(p)} for p in open_ports],
     }
 
-    if not is_up or not resolve:
-        return result
-
-    result["hostname"] = await resolve_hostname(ip)
-
-    # Port scanning if requested
-    if request.scan_ports and request.port_list:
-        port_results = await asyncio.gather(
-            *(check_port(ip, port, semaphore) for port in request.port_list)
-        )
-        result["open_ports"] = [p for p in port_results if p is not None]
-
+    if is_up and resolve:
+        result["hostname"] = await resolve_hostname(ip)
     return result
 
 

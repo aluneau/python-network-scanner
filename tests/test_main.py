@@ -112,7 +112,11 @@ def test_scan_lifecycle_with_port_scan():
         assert len(hosts) == 1
         assert hosts[0]["ip"] == "127.0.0.1"
         assert hosts[0]["is_up"] is True
-        assert hosts[0]["open_ports"] == [open_port]
+        # localhost may also run real services on main ports (ssh, ...)
+        assert open_port in hosts[0]["open_ports"]
+        assert closed_port not in hosts[0]["open_ports"]
+        assert {"port": open_port, "service": main.service_name(open_port)} in hosts[0]["services"]
+        assert status["networks"] == ["127.0.0.1/32"]
         assert client.get("/api/v1/scans").json()[0]["scan_id"] == scan_id
     finally:
         listener.close()
@@ -120,14 +124,14 @@ def test_scan_lifecycle_with_port_scan():
 
 def test_host_with_only_closed_ports_is_up():
     # 127.0.0.1 refuses connections on closed ports (RST) -> host is alive
-    with patch.object(main, "COMMON_PORTS", [free_port()]):
+    with patch.object(main, "MAIN_PORTS", {free_port(): "test"}):
         result = asyncio.run(main.check_host("127.0.0.1", main.ScanRequest()))
     assert result["is_up"] is True
 
 
 def test_unreachable_host_is_down():
     # TEST-NET-1 (RFC 5737) is never routed
-    with patch.object(main, "COMMON_PORTS", [80]):
+    with patch.object(main, "MAIN_PORTS", {80: "http"}):
         result = asyncio.run(main.check_host("192.0.2.1", main.ScanRequest()))
     assert result["is_up"] is False
     assert result["hostname"] is None
@@ -136,7 +140,7 @@ def test_unreachable_host_is_down():
 def test_large_network_is_capped():
     seen = []
 
-    async def fake_check(ip, request, semaphore=None):
+    async def fake_check(ip, request, semaphore=None, resolve=True):
         seen.append(ip)
         return {"ip": ip, "is_up": False}
 
@@ -148,7 +152,7 @@ def test_large_network_is_capped():
 def test_auto_scan_skips_loopback():
     scanned = []
 
-    async def fake_scan(network, request):
+    async def fake_scan(network, request, semaphore=None):
         scanned.append(str(network))
         return []
 
@@ -159,24 +163,21 @@ def test_auto_scan_skips_loopback():
     with patch("main.list_interfaces", return_value=fake_ifaces), \
             patch("main.list_routes", return_value=[]), \
             patch("main.scan_network", fake_scan):
-        client.post("/api/v1/scan", json={})
+        client.post("/api/v1/scan", json={"include_common_networks": False})
     assert scanned == ["192.168.1.0/24"]
 
 
-def run_auto_scan(interfaces, up_gateways, routes=()):
+def run_auto_scan(interfaces, routes=(), body=None):
     scanned = []
 
-    async def fake_scan(network, request):
+    async def fake_scan(network, request, semaphore=None):
         scanned.append(str(network))
         return []
 
-    async def fake_check(ip, request, semaphore=None, resolve=True):
-        return {"ip": ip, "is_up": ip in up_gateways}
-
     with patch("main.list_interfaces", return_value=interfaces), \
-            patch("main.list_routes", return_value=routes), \
-            patch("main.scan_network", fake_scan), patch("main.check_host", fake_check):
-        scan_id = client.post("/api/v1/scan", json={}).json()["scan_id"]
+            patch("main.list_routes", return_value=list(routes)), \
+            patch("main.scan_network", fake_scan):
+        scan_id = client.post("/api/v1/scan", json=body or {}).json()["scan_id"]
     return scanned, main.scans[scan_id]
 
 
@@ -184,28 +185,36 @@ POD_IFACES = [
     {"name": "lo", "ip": "127.0.0.1", "netmask": "255.0.0.0", "network": "127.0.0.0/8"},
     {"name": "eth0", "ip": "10.42.0.17", "netmask": "255.255.255.255", "network": "10.42.0.17/32"},
 ]
+COMMON = ["192.168.0.0/24", "192.168.1.0/24", "192.168.88.0/24", "10.0.0.0/24"]
 
 
-def test_fallback_gateways_used_when_no_usable_network():
-    scanned, scan = run_auto_scan(POD_IFACES, {"192.168.1.1", "10.0.0.1"})
-    assert scanned == ["192.168.1.0/24", "10.0.0.0/24"]
+def test_common_networks_scanned_when_nothing_detected():
+    scanned, scan = run_auto_scan(POD_IFACES)
+    assert scanned == COMMON
     assert scan["status"] == "completed"
-    assert scan["network_info"]["fallback_networks"] == scanned
+    assert scan["networks"] == COMMON
 
 
-def test_fallback_with_no_interfaces_and_nothing_answering():
-    scanned, scan = run_auto_scan([], set())
-    assert scanned == []
-    assert scan["status"] == "completed"
-    assert scan["network_info"]["fallback_networks"] == []
-
-
-def test_no_fallback_when_real_network_found():
+def test_common_networks_added_after_detected_network():
     ifaces = POD_IFACES + [{"name": "ens18", "ip": "10.244.1.5", "netmask": "255.255.255.0",
                             "network": "10.244.1.0/24"}]
-    scanned, scan = run_auto_scan(ifaces, {"192.168.1.1"})
-    assert scanned == ["10.244.1.0/24"]
-    assert "fallback_networks" not in scan["network_info"]
+    scanned, _ = run_auto_scan(ifaces)
+    assert scanned == ["10.244.1.0/24"] + COMMON
+
+
+def test_common_networks_can_be_disabled():
+    scanned, _ = run_auto_scan(POD_IFACES, body={"include_common_networks": False})
+    assert scanned == []
+
+
+def test_explicit_network_skips_common_networks():
+    scanned, _ = run_auto_scan(POD_IFACES, body={"network": "172.16.5.0/24"})
+    assert scanned == ["172.16.5.0/24"]
+
+
+def test_common_networks_env_override():
+    assert [str(n) for n in main.parse_networks("10.1.0.0/24, bad, 172.20.0.0/16")] == \
+        ["10.1.0.0/24", "172.20.0.0/16"]
 
 
 def iface(name, cidr):
@@ -229,10 +238,11 @@ NODE_ROUTES = [
 
 
 def test_node_level_scans_uplink_not_cni():
-    scanned, scan = run_auto_scan(NODE_IFACES, set(), NODE_ROUTES)
-    assert scanned == ["192.168.88.0/24"]
+    scanned, scan = run_auto_scan(NODE_IFACES, NODE_ROUTES)
+    # node LAN first; 192.168.88.0/24 is not repeated from the common list
+    assert scanned == ["192.168.88.0/24", "192.168.0.0/24", "192.168.1.0/24", "10.0.0.0/24"]
     assert scan["network_info"]["default_interface"] == "ens18"
-    assert "fallback_networks" not in scan["network_info"]
+    assert not any(n.startswith(("10.42.", "172.17.", "10.43.")) for n in scanned)
 
 
 def test_uplink_first_then_other_physical_interfaces():
@@ -294,5 +304,30 @@ def test_public_ip_endpoint_unavailable():
 
 
 def test_scan_records_public_ip():
-    scanned, scan = run_auto_scan(NODE_IFACES, set(), NODE_ROUTES)
+    scanned, scan = run_auto_scan(NODE_IFACES, NODE_ROUTES)
     assert scan["network_info"]["public_ip"] == "203.0.113.7"
+
+
+def test_main_ports_cover_key_services():
+    services = set(main.MAIN_PORTS.values())
+    assert {"ssh", "http", "https", "ftp", "smb", "rdp", "mysql", "postgresql"} <= services
+    assert client.get("/api/v1/ports").json()[0] == {"port": 21, "service": "ftp"}
+
+
+def test_extra_ports_added_to_main_ports():
+    ports = main.ports_to_probe(main.ScanRequest(port_list=[22, 12345, 12345]))
+    assert ports == list(main.MAIN_PORTS) + [12345]
+
+
+def test_scan_ports_false_hides_ports():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    try:
+        with patch.object(main, "MAIN_PORTS", {port: "test"}):
+            result = asyncio.run(main.check_host("127.0.0.1", main.ScanRequest(scan_ports=False)))
+    finally:
+        listener.close()
+    assert result["is_up"] is True
+    assert result["open_ports"] == [] and result["services"] == []
