@@ -1,0 +1,64 @@
+# One scanner per node, running in the node's network namespace so it sees
+# the node's real interfaces, routes and LAN (not the pod network).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: network-scanner
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: network-scanner
+  namespace: network-scanner
+  labels:
+    app: network-scanner
+spec:
+  selector:
+    matchLabels:
+      app: network-scanner
+  template:
+    metadata:
+      labels:
+        app: network-scanner
+    spec:
+      hostNetwork: true
+      # Keep cluster DNS working with hostNetwork
+      dnsPolicy: ClusterFirstWithHostNet
+      # Run on every node, including control-plane nodes
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: scanner
+          image: network-scanner:latest  # replace with your registry image
+          imagePullPolicy: IfNotPresent
+          env:
+            # Binds on the node itself: pick a port that is free on every node
+            - name: PORT
+              value: "8080"
+          ports:
+            - name: http
+              containerPort: 8080
+              hostPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
