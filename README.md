@@ -10,7 +10,12 @@ A FastAPI-based network scanner that discovers the gateway, network configuratio
 - **Port Scanning**: Optional port scanning on discovered hosts
 - **Async**: Fully asynchronous for better performance
 
-- **Gateway fallback**: when no usable network is detected (e.g. a Kubernetes pod with a /32 address), probes 192.168.0.1, 192.168.1.1, 192.168.88.1 and 10.0.0.1 and scans the /24 of each one that answers (`FALLBACK_GATEWAYS` in `main.py`)
+- **Common networks**: when no `network` is given, scans the detected node network plus
+  192.168.0.0/24, 192.168.1.0/24, 192.168.88.0/24 and 10.0.0.0/24
+  (override with `COMMON_NETWORKS="a/24,b/24"`, disable per scan with `"include_common_networks": false`)
+- **Main ports**: every host is checked on ~40 service ports (ssh, http/https, ftp, smb, rdp,
+  databases, Kubernetes, ...) and open ones are reported with their service name
+  (`GET /api/v1/ports` lists them; add more per scan with `port_list`)
 
 ## API Endpoints
 
@@ -22,6 +27,7 @@ A FastAPI-based network scanner that discovers the gateway, network configuratio
 - `GET /api/v1/scan/{scan_id}` - Get scan status
 - `GET /api/v1/scan/{scan_id}/results` - Get scan results
 - `GET /api/v1/scans` - List all scans
+- `GET /api/v1/ports` - List the main ports probed on every host
 
 ## Running Locally
 
@@ -64,10 +70,13 @@ curl http://<node-ip>:8080/api/v1/network/info
 # Get network info
 curl http://localhost:8080/api/v1/network/info
 
-# Start a scan
+# Scan the node network + common networks on all main ports
+curl -X POST http://localhost:8080/api/v1/scan -H "Content-Type: application/json" -d '{}'
+
+# Scan one network, with extra ports
 curl -X POST http://localhost:8080/api/v1/scan \
   -H "Content-Type: application/json" \
-  -d '{"network": "192.168.1.0/24", "scan_ports": true}'
+  -d '{"network": "192.168.1.0/24", "port_list": [8123, 32400]}'
 
 # Check scan status
 curl http://localhost:8080/api/v1/scan/{scan_id}
