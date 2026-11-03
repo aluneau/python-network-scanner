@@ -18,3 +18,4 @@ env/
 *.swo
 *~
 .DS_Store
+.pytest_cache/
